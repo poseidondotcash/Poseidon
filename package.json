@@ -1,0 +1,28 @@
+{
+  "name": "poseidon-wallet",
+  "version": "1.0.0",
+  "description": "Privacy-preserving wallet on Solana using zkSNARKs (Groth16)",
+  "author": "Poseidon Team",
+  "license": "MIT",
+  "scripts": {
+    "build-circuit": "cd circuits && ./build.sh",
+    "test:deposit": "node tests/run_deposits.js",
+    "test:withdraw": "node tests/withdraw_join_split.js",
+    "relayer": "node tests/relayer.js"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.95.8",
+    "bs58": "^6.0.0",
+    "circomlibjs": "^0.1.7",
+    "dotenv": "^16.4.7",
+    "keccak": "^3.0.4",
+    "snarkjs": "^0.7.5",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

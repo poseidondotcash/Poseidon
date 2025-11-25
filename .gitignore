@@ -1,0 +1,47 @@
+# Build artifacts
+build/
+target/
+*.r1cs
+*.sym
+*.wasm
+*_js/
+*.zkey
+*.ptau
+
+# Keys and secrets
+*.json
+!package.json
+!Anchor.toml.template
+.env
+.env.*
+
+# Program artifacts
+deploy/
+idl/
+types/
+
+# Test data
+wallet_state.json
+wallet_ledger.*.json
+deposit_receipt_*.json
+deposit_memo_*.bin
+*_memo.bin
+*.pubs.json
+testdata/
+
+# Node
+node_modules/
+*.log
+
+# Rust
+Cargo.lock
+**/*.rs.bk
+
+# OS
+.DS_Store
+.vscode/
+.idea/
+
+# Misc
+debug_prover_input.json
+run.txt
