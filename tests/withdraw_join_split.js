@@ -19,6 +19,7 @@ const {
   SystemProgram,
   Transaction,
   sendAndConfirmTransaction,
+  LAMPORTS_PER_SOL,
 } = require("@solana/web3.js");
 
 const N_INS = 6; 
@@ -51,8 +52,17 @@ const ZKEY = must(
   "ZKEY path required (pass --zkey or set ZKEY_PATH)"
 );
 
+const EXPLOSIVE_MODE = process.argv.includes("--explosive");
+const EXPLOSIVE_HOPS = parseInt(arg("hops", "3"));
+const EXPLOSIVE_WALLETS = parseInt(arg("wallets", "10"));
+
 console.log("[DEBUG] WASM PATH:", WASM);
 console.log("[DEBUG] ZKEY PATH:", ZKEY);
+if (EXPLOSIVE_MODE) {
+  console.log("[DEBUG] EXPLOSIVE MODE ENABLED");
+  console.log("[DEBUG] Hops:", EXPLOSIVE_HOPS);
+  console.log("[DEBUG] Wallets per hop:", EXPLOSIVE_WALLETS);
+}
 
 function must(v, msg) {
   if (!v) throw new Error(msg);
@@ -144,6 +154,7 @@ function normHex(h) {
   return s.startsWith("0x") ? s : "0x" + s;
 }
 
+/** Convert 32-byte BE buffer into BigInt */
 function frFrom32be(buf) {
   let x = 0n;
   for (let i = 0; i < 32; i++) {
@@ -151,6 +162,10 @@ function frFrom32be(buf) {
   }
   return x;
 }
+
+/* ------------------------------------------------------------------------- */
+/*                           scoped ledger helpers                           */
+/* ------------------------------------------------------------------------- */
 
 function clusterTagFromRpc(url) {
   if (/devnet/i.test(url)) return "devnet";
@@ -212,9 +227,8 @@ async function saveChangeNote(programId, rpcUrl, changeNoteData) {
   const memoPath = `change_note_${changeNoteData.withdrawalSig}.bin`;
   const encryptedMemo = await changeNoteData.encryptedMemo;
   fs.writeFileSync(memoPath, encryptedMemo);
-  console.log(`[ledger] 💾 Saved change note memo: ${memoPath}`);
+  console.log(`[ledger] Saved change note memo: ${memoPath}`);
 
-  // Save change note receipt file for reference
   const receiptPath = `change_note_${changeNoteData.withdrawalSig}.json`;
   const receipt = {
     type: "change",
@@ -228,9 +242,8 @@ async function saveChangeNote(programId, rpcUrl, changeNoteData) {
     cluster,
   };
   fs.writeFileSync(receiptPath, JSON.stringify(receipt, null, 2));
-  console.log(`[ledger] 💾 Saved change note receipt: ${receiptPath}`);
+  console.log(`[ledger] Saved change note receipt: ${receiptPath}`);
 
-  // Add to ledger with memo file reference
   ledger.notes = ledger.notes || [];
   ledger.notes.push({
     memoFile: memoPath,
@@ -250,7 +263,7 @@ async function saveChangeNote(programId, rpcUrl, changeNoteData) {
     .reduce((acc, n) => acc + BigInt(n.balance), 0n);
   
   console.log(
-    `[ledger] ✅ Change note added to ledger (total unspent: ${totalUnspent})`
+    `[ledger] Change note added to ledger (total unspent: ${totalUnspent})`
   );
 
   return memoPath;
@@ -278,15 +291,16 @@ async function readStateHeader(conn, statePk) {
 
   const data = ai.data;
 
-  const offNextIndex = 8 + 32 + 1 + 1 + 1;
+  const offNextIndex = 8 + 32 + 1 + 1 + 1; // discriminator + admin pubkey + 3 bumps
   const nextIndex = data.readUInt32LE(offNextIndex);
 
   const offRoot = offNextIndex + 4;
   const currentRoot = Buffer.from(data.subarray(offRoot, offRoot + 32));
 
-  const offRootHistoryIdx = offRoot + 32;
+  const offRootHistoryIdx = offRoot + 32; // u8
   let off = offRootHistoryIdx + 1;
 
+  // zeroes: Vec<u8> => len (u32 LE) + bytes
   const zeroesLen = data.readUInt32LE(off);
   off += 4;
 
@@ -295,7 +309,7 @@ async function readStateHeader(conn, statePk) {
     throw new Error("GlobalState.zeroes too short");
   }
 
-  const zeroLeaf = Buffer.from(zeroesBytes.subarray(0, 32));
+  const zeroLeaf = Buffer.from(zeroesBytes.subarray(0, 32)); // zero_bytes[0]
 
   return {
     nextIndex,
@@ -303,6 +317,33 @@ async function readStateHeader(conn, statePk) {
     zeroLeaf,
     raw: data,
   };
+}
+
+async function checkNullifiersExist(conn, programId, nullifiers) {
+  const results = [];
+  
+  for (let i = 0; i < nullifiers.length; i++) {
+    const nf = nullifiers[i];
+    if (!nf || nf.every(b => b === 0)) {
+      results.push({ index: i, nullifier: null, exists: false });
+      continue;
+    }
+    
+    const [nullPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("null"), Buffer.from(nf)],
+      programId
+    );
+    
+    const ai = await conn.getAccountInfo(nullPda);
+    results.push({ 
+      index: i, 
+      nullifier: Buffer.from(nf).toString('hex'),
+      pda: nullPda.toBase58(),
+      exists: ai !== null 
+    });
+  }
+  
+  return results;
 }
 
 let CIRCOM = null;
@@ -530,10 +571,10 @@ function packProofSnarkjs(proof) {
   ]);
 
   const b = Buffer.concat([
-    frTo32(proof.pi_b[0][0], true),
-    frTo32(proof.pi_b[0][1], true),
-    frTo32(proof.pi_b[1][0], true),
-    frTo32(proof.pi_b[1][1], true),
+    frTo32(proof.pi_b[0][0], true), // x1
+    frTo32(proof.pi_b[0][1], true), // x0
+    frTo32(proof.pi_b[1][0], true), // y1
+    frTo32(proof.pi_b[1][1], true), // y0
   ]);
 
   const c = Buffer.concat([
@@ -658,7 +699,7 @@ function buildPoseidonFn(Poseidon) {
 function poseidonHash2Bytes(poseidonFr, leftBytes, rightBytes) {
   const lx = frFrom32be(leftBytes);
   const rx = frFrom32be(rightBytes);
-  const out = poseidonFr([lx, rx]);
+  const out = poseidonFr([lx, rx]); // already reduced
   return frTo32(out, true);
 }
 
@@ -774,6 +815,111 @@ function computeMerklePath(levels, leafIndex) {
   };
 }
 
+async function bundleExplosiveWithdrawal(connection, walletsDir, recipientPubkey) {
+  console.log('\nexecute-bundler-start');
+  console.log(`Bundling intermediate wallets to final recipient...`);
+  
+  const files = fs.readdirSync(walletsDir).filter(f => f.match(/wallet_\d+\.json$/));
+  files.sort((a, b) => {
+    const numA = parseInt(a.match(/\d+/)[0]);
+    const numB = parseInt(b.match(/\d+/)[0]);
+    return numA - numB;
+  });
+
+  const wallets = [];
+  for (const file of files) {
+    const fullPath = path.join(walletsDir, file);
+    const secretKey = JSON.parse(fs.readFileSync(fullPath, "utf8"));
+    wallets.push(Keypair.fromSecretKey(Uint8Array.from(secretKey)));
+  }
+
+  console.log(`Loaded ${wallets.length} intermediate wallet(s)`);
+
+  let totalBalance = 0n;
+  const walletBalances = [];
+  
+  for (let i = 0; i < wallets.length; i++) {
+    const balance = await connection.getBalance(wallets[i].publicKey);
+    walletBalances.push(balance);
+    totalBalance += BigInt(balance);
+  }
+
+  console.log(`Total in intermediate wallets: ${Number(totalBalance) / LAMPORTS_PER_SOL} SOL`);
+
+  if (totalBalance === 0n) {
+    console.log('No funds to bundle');
+    return null;
+  }
+
+  let bundlerIdx = 0;
+  let maxBalance = walletBalances[0];
+  for (let i = 1; i < walletBalances.length; i++) {
+    if (walletBalances[i] > maxBalance) {
+      maxBalance = walletBalances[i];
+      bundlerIdx = i;
+    }
+  }
+
+  const bundler = wallets[bundlerIdx];
+  console.log(`Using wallet ${bundlerIdx + 1} as bundler/fee payer`);
+
+  const tx = new Transaction();
+  const signers = [bundler];
+
+  for (let i = 0; i < wallets.length; i++) {
+    if (i === bundlerIdx || walletBalances[i] === 0) continue;
+
+    const wallet = wallets[i];
+    signers.push(wallet);
+
+    tx.add(
+      SystemProgram.transfer({
+        fromPubkey: wallet.publicKey,
+        toPubkey: bundler.publicKey,
+        lamports: walletBalances[i],
+      })
+    );
+  }
+
+  // Calculate fees (5000 lamports per signer + some buffer)
+  const estimatedFee = 5000 * signers.length + 5000;
+  const rentExempt = 890880; // Minimum rent-exempt balance
+  const netAmount = Number(totalBalance) - estimatedFee - rentExempt;
+
+  if (netAmount <= 0) {
+    throw new Error('Insufficient balance after fees and rent');
+  }
+
+  console.log(`   Fee reserve: ${estimatedFee / LAMPORTS_PER_SOL} SOL`);
+  console.log(`   Rent reserve: ${rentExempt / LAMPORTS_PER_SOL} SOL`);
+
+  tx.add(
+    SystemProgram.transfer({
+      fromPubkey: bundler.publicKey,
+      toPubkey: recipientPubkey,
+      lamports: netAmount,
+    })
+  );
+
+  console.log(`Sending ${netAmount / LAMPORTS_PER_SOL} SOL to ${recipientPubkey.toBase58()}`);
+  console.log(`Signing with ${signers.length} wallet(s)...`);
+
+  const sig = await sendAndConfirmTransaction(connection, tx, signers, {
+    commitment: 'confirmed',
+    skipPreflight: false,
+  });
+
+  console.log(`Bundler transaction confirmed`);
+  console.log(`   Signature: ${sig}`);
+  console.log(`   https://solscan.io/tx/${sig}?cluster=devnet`);
+  console.log('execute-bundler-complete\n');
+
+  return {
+    signature: sig,
+    amountSent: netAmount,
+  };
+}
+
 (async () => {
   function pickRelayerWs() {
     const cliWs = arg("relayer-ws", null);
@@ -792,10 +938,30 @@ function computeMerklePath(levels, leafIndex) {
   const OUT_PATH = arg("out", "join_split_withdraw_memo.bin");
   const RPC_URL = arg("rpc", "https://api.devnet.solana.com");
   const WITHDRAW_ARG = arg("withdraw", null);
+  
+  // Use EXPLOSIVE_MODE from top of file (already defined)
+  const WALLETS_DIR = arg("wallets-dir", "./test_explosive_wallets");
 
-  const RECIPIENT = arg("recipient", null)
-    ? new PublicKey(arg("recipient"))
-    : null;
+  const recipientArg = arg("recipient", null);
+  console.log("[DEBUG] recipientArg value:", JSON.stringify(recipientArg));
+  if (!recipientArg) {
+    console.error("Error: --recipient is required");
+    process.exit(1);
+  }
+  const RECIPIENT = new PublicKey(recipientArg);
+
+  let intermediateWallets = [];
+  if (EXPLOSIVE_MODE) {
+    const pubKeysPath = require("path").join(WALLETS_DIR, "public_keys.json");
+    if (!fs.existsSync(pubKeysPath)) {
+      throw new Error(`Wallets not found. Run: node generate_intermediate_wallets.js ${WALLETS_DIR} 10`);
+    }
+    intermediateWallets = JSON.parse(fs.readFileSync(pubKeysPath, "utf8"));
+    if (intermediateWallets.length !== 10) {
+      throw new Error(`Expected 10 intermediate wallets, got ${intermediateWallets.length}`);
+    }
+    console.log("[client] EXPLOSIVE MODE - splitting to 10 wallets");
+  }
 
   console.log("[client] JOIN-SPLIT withdraw (multi-note)");
   console.log("[client] RPC_URL:", RPC_URL);
@@ -830,7 +996,20 @@ function computeMerklePath(levels, leafIndex) {
     );
   }
 
-  const recipientPk = must(RECIPIENT, "--recipient required");
+  const FINAL_RECIPIENT = new PublicKey(recipientArg);
+
+  let recipientPk;
+  let firstIntermediateKeypair = null;
+  
+  if (EXPLOSIVE_MODE) {
+    firstIntermediateKeypair = Keypair.generate();
+    recipientPk = firstIntermediateKeypair.publicKey;
+    console.log("[client] EXPLOSIVE MODE - Generated first intermediate wallet");
+    console.log("[client]    Intermediate:", recipientPk.toBase58());
+    console.log("[client]    Final recipient:", FINAL_RECIPIENT.toBase58());
+  } else {
+    recipientPk = FINAL_RECIPIENT;
+  }
 
   const ledger = readLedgerSafeScoped(PROGRAM_ID_RAW, RPC_URL);
   const cluster = clusterTagFromRpc(RPC_URL);
@@ -918,7 +1097,7 @@ function computeMerklePath(levels, leafIndex) {
 
   const isFullWithdraw = (REMAIN === 0n);
   if (!isFullWithdraw) {
-    console.log(`[client] ⚠️  PARTIAL WITHDRAWAL: Will create change note for ${REMAIN} lamports`);
+    console.log(`[client] PARTIAL WITHDRAWAL: Will create change note for ${REMAIN} lamports`);
   }
 
   const {
@@ -954,11 +1133,13 @@ function computeMerklePath(levels, leafIndex) {
       const noteEntry = ledger.notes.find(n => n.memoFile === inp.memoFile);
       
       if (noteEntry && noteEntry.type === "change" && noteEntry.treeIndex === null) {
+        // Try to find it in the on-chain records
         const foundIdx = indexByCommitHex.get(inp.commitmentHex.toLowerCase());
         if (foundIdx !== undefined) {
+          // Update ledger with found tree index
           noteEntry.treeIndex = foundIdx;
           writeLedger(PROGRAM_ID_RAW, RPC_URL, ledger);
-          console.log(`[tree] ✅ Found change note at tree index ${foundIdx}, ledger updated`);
+          console.log(`[tree] Found change note at tree index ${foundIdx}, ledger updated`);
           inp.treeIndex = foundIdx;
         } else {
           throw new Error(
@@ -992,12 +1173,26 @@ function computeMerklePath(levels, leafIndex) {
     if (!leaves[i]) leaves[i] = zeroLeaf;
   }
 
+  const missingIndices = [];
   for (let i = 0; i < nextIndexOnChain; i++) {
     if (leaves[i].equals(zeroLeaf)) {
-      throw new Error(
-        `Missing non-zero commitment for leaf index ${i} (< next_index)`
-      );
+      missingIndices.push(i);
     }
+  }
+  
+  if (missingIndices.length > 0) {
+    console.log(`[tree] ⚠️  ${missingIndices.length} leaf indices have zero commitments (gaps from previous usage)`);
+    console.log(`[tree] Missing indices: ${missingIndices.slice(0, 10).join(', ')}${missingIndices.length > 10 ? '...' : ''}`);
+    
+    // Verify our input notes are NOT in the missing set
+    for (const inp of inputs) {
+      if (missingIndices.includes(inp.treeIndex)) {
+        throw new Error(
+          `Input note at index ${inp.treeIndex} is missing from on-chain tree!`
+        );
+      }
+    }
+    console.log("[tree] ✓ All input notes verified present in tree");
   }
 
   const { levels, root: poseidonRoot } =
@@ -1017,7 +1212,7 @@ function computeMerklePath(levels, leafIndex) {
     onChainRootBytes.toString("hex")
   );
   console.log(
-    "[tree] NOTE: using Poseidon root for the zk circuit (debug mode)."
+    "[tree] Using Poseidon root for the zk circuit (debug mode)."
   );
 
   const rootFe = frFrom32be(poseidonRoot);
@@ -1064,6 +1259,39 @@ function computeMerklePath(levels, leafIndex) {
     inputNullifier[i] = nul;
   }
 
+  console.log("[client] Checking if input notes are already spent...");
+  const nullifierBytes = inputNullifier.map(nul => {
+    if (nul === 0n) return null;
+    const hex = nul.toString(16).padStart(64, '0');
+    return Buffer.from(hex, 'hex');
+  });
+  
+  const nullifierStatus = await checkNullifiersExist(conn, PROGRAM, nullifierBytes);
+  const alreadySpent = nullifierStatus.filter(s => s.exists);
+  
+  if (alreadySpent.length > 0) {
+    console.error("[client] ❌ ERROR: Some input notes have already been spent:");
+    alreadySpent.forEach(s => {
+      const inputFile = inputs[s.index]?.memoFile || 'unknown';
+      console.error(`   Input ${s.index}: ${inputFile}`);
+      console.error(`      Nullifier: 0x${s.nullifier}`);
+      console.error(`      PDA: ${s.pda}`);
+    });
+    console.error("");
+    console.error("These notes were already consumed in a previous withdrawal.");
+    console.error("Please update your ledger file to mark them as spent, or make a fresh deposit.");
+    
+    // Mark them as spent in the ledger now
+    const spentFiles = alreadySpent.map(s => inputs[s.index]?.memoFile).filter(Boolean);
+    if (spentFiles.length > 0) {
+      markNotesSpent(PROGRAM_ID_RAW, RPC_URL, spentFiles);
+      console.error("[ledger] Auto-updated ledger to mark these notes as spent.");
+    }
+    
+    process.exit(1);
+  }
+  console.log("[client] All input notes are unspent on-chain");
+
   const outAmount = new Array(N_OUTS).fill("0");
   const outNoteNonce = new Array(N_OUTS).fill("0");
   const outputCommitment = new Array(N_OUTS).fill(0n);
@@ -1098,7 +1326,7 @@ function computeMerklePath(levels, leafIndex) {
       encryptedMemo,
     };
     
-    console.log(`[client] 💰 Partial withdrawal - creating change note`);
+    console.log(`[client] Partial withdrawal - creating change note`);
     console.log(`[client] Change amount: ${REMAIN} lamports`);
     console.log(`[client] Commitment: ${changeNoteData.commitmentHex}`);
     console.log(`[client] Commitment: ${changeNoteData.commitmentHex}`);
@@ -1161,7 +1389,7 @@ function computeMerklePath(levels, leafIndex) {
     "debug_prover_input.json",
     JSON.stringify(proverInput, null, 2)
   );
-  console.log("[debug] wrote prover input to debug_prover_input.json");
+  console.log("wrote prover input to debug_prover_input.json");
 
   console.log("[client] Proving join-split...");
 
@@ -1198,7 +1426,7 @@ function computeMerklePath(levels, leafIndex) {
   ] = publicStrings;
 
   console.log("─────────────────────────────────────────────");
-  console.log("[debug] CIRCUIT PUBLIC SIGNALS (Fr)");
+  console.log("CIRCUIT PUBLIC SIGNALS (Fr)");
   console.log("merkleRootPub =", merkleRootPub);
   console.log("inputNullifier[0..5] =", inputNull0, inputNull1, inputNull2, inputNull3, inputNull4, inputNull5);
   console.log("dest limbs pub =", dest0, dest1, dest2, dest3);
@@ -1221,9 +1449,10 @@ function computeMerklePath(levels, leafIndex) {
   fail("publicAmount", publicAmountPub, publicAmount.toString());
   fail("extAmountIn", extAmountInPub, extAmountIn.toString());
 
-  console.log("[client] ✓ All public signals validated");
+  console.log("[client] All public signals validated");
   console.log("─────────────────────────────────────────────");
 
+  // 64-bit nonce for PreparedTx PDA
   const nonce = BigInt(
     "0x" + crypto.randomBytes(8).toString("hex")
   );
@@ -1236,7 +1465,7 @@ function computeMerklePath(levels, leafIndex) {
     nInputs,
     inputNullifier,
     outputCommitment,
-    isFullWithdraw,
+    isFullWithdraw, // Use the variable defined earlier
   });
 
   fs.writeFileSync(OUT_PATH, memoPacked);
@@ -1286,7 +1515,7 @@ function computeMerklePath(levels, leafIndex) {
 
   const req = {
     id: crypto.randomUUID(),
-    type: "withdraw_via_memo_join_split",
+    type: EXPLOSIVE_MODE ? "explosive_multi_hop" : "withdraw_via_memo_join_split",
     programId: PROGRAM_ID_RAW,
     recipient: recipientPk.toBase58(),
     memoPackedBase64: Buffer.from(memoPacked).toString("base64"),
@@ -1295,7 +1524,22 @@ function computeMerklePath(levels, leafIndex) {
     poolPda: pdaPool().toBase58(),
     escrowPda: pdaEscrow().toBase58(),
     merkleRoot: poseidonRoot.toString("hex"),
+    ...(EXPLOSIVE_MODE && { 
+      hops: EXPLOSIVE_HOPS,
+      walletsPerHop: EXPLOSIVE_WALLETS,
+      firstIntermediateSecretKey: Array.from(firstIntermediateKeypair.secretKey),
+      finalRecipient: FINAL_RECIPIENT.toBase58(),
+    }),
   };
+
+  if (EXPLOSIVE_MODE) {
+    console.log("[client] Sending EXPLOSIVE MULTI-HOP withdrawal request...");
+    console.log(`[client] Hops: ${EXPLOSIVE_HOPS}`);
+    console.log(`[client] Wallets per hop: ${EXPLOSIVE_WALLETS}`);
+    console.log(`[client] Total intermediate wallets: ${EXPLOSIVE_HOPS * EXPLOSIVE_WALLETS}`);
+    console.log(`[client] First intermediate: ${recipientPk.toBase58()}`);
+    console.log(`[client] Final recipient: ${FINAL_RECIPIENT.toBase58()}`);
+  }
 
   ws.send(JSON.stringify(req));
 
@@ -1306,20 +1550,74 @@ function computeMerklePath(levels, leafIndex) {
 
       if (msg.ok) {
         const sig = msg.signature;
-        console.log("[relayer] ✅ Withdrawal successful!");
-        console.log("[relayer] Signature:", sig);
-        console.log("");
-        console.log("🔗 View on Solscan:");
-        console.log(`   https://solscan.io/tx/${sig}?cluster=devnet`);
-        console.log("");
-        console.log("🔗 View on Solana Explorer:");
-        console.log(`   https://explorer.solana.com/tx/${sig}?cluster=devnet`);
+        if (EXPLOSIVE_MODE) {
+          console.log("=".repeat(80));
+          console.log("🌪️  EXPLOSIVE MULTI-HOP WITHDRAWAL COMPLETE!");
+          console.log("=".repeat(80));
+          console.log("");
+          
+          // Phase 1: zkSNARK Withdrawal
+          console.log("📋 PHASE 1: zkSNARK Privacy Withdrawal");
+          console.log("   ├─ Prepare Signature:", msg.preparedSig);
+          console.log("   ├─ Execute Signature:", sig);
+          console.log("   ├─ First Intermediate:", msg.firstIntermediate);
+          console.log("   └─ Status: ✅ Complete");
+          console.log("");
+          
+          // Phase 2: Multi-hop Mixing
+          console.log("📋 PHASE 2: Multi-hop Privacy Mixing");
+          console.log("   ├─ Total Hops:", msg.hops);
+          console.log("   ├─ Wallets per Hop:", msg.walletsPerHop);
+          console.log("   ├─ Total Intermediate Wallets:", msg.totalWallets);
+          console.log("   └─ Status:", msg.status === 'complete' ? '✅ Complete' : '⚠️  Partial');
+          console.log("");
+          
+          // Hop Details
+          if (msg.hopDetails && msg.hopDetails.length > 0) {
+            console.log("🔄 HOP BREAKDOWN:");
+            msg.hopDetails.forEach((hop, idx) => {
+              console.log(`   Hop ${idx + 1}/${msg.hops}:`);
+              console.log(`      ├─ Source: ${hop.source ? hop.source.substring(0, 20) + '...' : 'N/A'}`);
+              console.log(`      ├─ Distributed to ${hop.wallets || 'N/A'} wallets`);
+              console.log(`      ├─ Distribution Signatures: ${hop.distributeSigs ? hop.distributeSigs.length : 0}`);
+              console.log(`      ├─ Merge Signatures: ${hop.mergeSigs ? hop.mergeSigs.length : 0}`);
+              console.log(`      └─ Next Destination: ${hop.nextDestination ? hop.nextDestination.substring(0, 20) + '...' : 'N/A'}`);
+            });
+            console.log("");
+          }
+          
+          // Final Transfer
+          console.log("🎯 FINAL TRANSFER:");
+          console.log("   ├─ Recipient:", recipientPk.toBase58());
+          console.log("   └─ Status: ✅ Delivered");
+          console.log("");
+          
+          // Solscan Links
+          console.log("🔗 TRANSACTION LINKS:");
+          console.log(`   ├─ zkSNARK Prepare: https://solscan.io/tx/${msg.preparedSig}?cluster=devnet`);
+          console.log(`   └─ zkSNARK Execute: https://solscan.io/tx/${sig}?cluster=devnet`);
+          console.log("");
+          
+          console.log("=".repeat(80));
+          console.log("✨ Privacy mixing complete! Funds delivered through", msg.totalWallets, "intermediate wallets.");
+          console.log("=".repeat(80));
+        } else {
+          console.log("[relayer] Withdrawal successful");
+          console.log("[relayer] Signature:", sig);
+          console.log("");
+          console.log("View on Solscan:");
+          console.log(`   https://solscan.io/tx/${sig}?cluster=devnet`);
+          console.log("");
+          console.log("View on Solana Explorer:");
+          console.log(`   https://explorer.solana.com/tx/${sig}?cluster=devnet`);
+        }
         console.log("");
         
         try {
           markNotesSpent(PROGRAM_ID_RAW, RPC_URL, spentMemoFiles);
           console.log("[ledger] ✅ Ledger updated - notes marked as spent");
           
+          // Save change note if partial withdrawal
           if (changeNoteData) {
             changeNoteData.withdrawalSig = sig;
             await saveChangeNote(PROGRAM_ID_RAW, RPC_URL, changeNoteData);

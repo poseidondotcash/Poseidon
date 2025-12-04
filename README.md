@@ -137,9 +137,11 @@ programs/poseidon/src/
 │   ├── init.rs         # Initialize global state
 │   ├── deposit.rs      # Deposit funds into pool
 │   ├── withdraw.rs     # Two-phase withdrawal
+│   ├── explosive.rs    # Split withdrawals across multiple wallets
 │   ├── fetch.rs        # Query note data
 │   ├── emergency.rs    # Emergency recovery (expired roots)
-│   └── migrate.rs      # State migration utilities
+│   ├── recover.rs      # Salted nullifier recovery
+│   └── cleanup.rs      # Orphaned nullifier cleanup
 └── utils/              # Core utilities
     ├── state.rs        # Account structures
     ├── merkle.rs       # Sparse Merkle tree operations
@@ -233,57 +235,182 @@ pub struct PreparedTx {
 #### NullifierFlag
 ```rust
 pub struct NullifierFlag {
-    pub bump: u8,                   // Created = note spent
+    pub bump: u8,
 }
 ```
 
 **PDA Seeds:** `[b"null", nullifier]`
+
+#### ExplosiveWithdrawal
+```rust
+pub struct ExplosiveWithdrawal {
+    pub bump: u8,
+    pub executed: bool,
+    pub nonce: u64,
+    pub final_recipient: Pubkey,
+    pub relayer: Pubkey,
+    pub total_amount: u64,
+    pub relayer_fee: u64,
+    pub num_receivers: u8,
+    pub transfers_completed: u16,      // Bitmask tracking completed transfers
+    pub intermediate_wallets: [Pubkey; MAX_EXPLOSIVE_RECEIVERS],
+    pub split_amounts: [u64; MAX_EXPLOSIVE_RECEIVERS],
+    pub created_slot: u64,
+}
+```
+
+**PDA Seeds:** `[b"explosive", nonce_be]`
 
 ## Transaction Flow
 
 ### Deposit
 ```
 1. User invokes deposit_with_note(amount, commitment, ciphertext)
-2. Lamport transfer executed: user_account → pool_pda
-3. Commitment inserted into sparse Merkle tree
-4. NoteRecord PDA allocated (rent paid by escrow_pda)
-5. Events emitted: NewNote, RootUpdated, DepositMade
+2. Lamport transfer: user_account → pool_pda
+3. Commitment inserted into sparse Merkle tree at next_index
+4. NoteRecord PDA created (rent paid by escrow_pda)
+5. Tree index assigned and stored in ledger for withdrawal
+6. Events emitted: NewNote, RootUpdated, DepositMade
 ```
 
-**Note:** No minimum deposit constraint enforced. Fee validation deferred to withdrawal phase.
+**Client Responsibilities:**
+- Generate random note nonce (256-bit)
+- Compute commitment: Poseidon(balance, noteNonce)
+- Encrypt note data with view key
+- Store memo file and tree index in local ledger
 
 ### Withdrawal (Two-Phase)
 
 #### Phase 1: Prepare
 ```
-1. User generates zkSNARK proof off-chain
-2. Relayer calls prepare_withdraw_via_memo(memo)
-3. Verify Groth16 proof with public inputs
-4. Process extAmountIn (if topping up pool)
-5. Calculate fees: relayer_fee = (amount * 15 / 10000) + 5_000_000
-
-7. Create nullifier PDAs for input notes
-8. Create note PDAs for output commitments (change)
-9. Create PreparedTx PDA (locks amounts/recipients)
+1. Client generates zkSNARK proof off-chain using WASM/ZKEY
+2. Client sends memo to relayer via WebSocket
+3. Relayer calls prepare_withdraw_via_memo(memo)
+4. Program verifies Groth16 proof with public inputs:
+   - merkleRoot (validates against root history)
+   - inputNullifier[6] (prevents double-spend)
+   - destLimbs[4] (recipient address binding)
+   - outputCommitment[6] (change notes)
+   - publicAmount (withdrawal amount)
+   - extAmountIn (pool top-up, if any)
+5. Fee calculation: relayer_fee = (amount × 15 / 10000) + 5_000_000
+6. Create NullifierFlag PDAs for each input (marks notes as spent)
+7. Create NoteRecord PDAs for non-zero output commitments (change)
+8. Create PreparedTx PDA (locks recipient, amounts, nonce)
 ```
 
 #### Phase 2: Execute
 ```
 1. Relayer calls execute_prepared_withdraw()
-2. Load PreparedTx, verify not executed
-3. Verify relayer authorization
-4. Transfer: pool → recipient (to_recipient)
-5. Transfer: pool → relayer (to_relayer)
-6. Mark PreparedTx as executed
+2. Load PreparedTx PDA, verify not executed
+3. Verify relayer authorization (whitelist check)
+4. Transfer: pool → recipient (to_recipient amount)
+5. Transfer: pool → relayer (to_relayer fee)
+6. Mark PreparedTx as executed (replay protection)
 7. Update accounting: total_withdrawn += payout
-8. Validate pool invariant
+8. Validate pool invariant: total_deposited >= total_withdrawn
 ```
 
 **Design Rationale:**
 - **Atomic Separation**: Proof verification isolated from fund transfers
-- **MEV Resistance**: Destination amounts immutably committed in PDA state
+- **MEV Resistance**: Recipient and amounts immutably committed in PreparedTx PDA
 - **Batch Optimization**: Multiple prepared transactions executable in single block
 - **Fault Tolerance**: Failed execution retryable without re-verification
+
+### Explosive Withdrawals (Multi-Hop Privacy Mixing)
+
+Explosive withdrawals enhance privacy by splitting a withdrawal across multiple intermediate wallets with random amounts before final bundling to the recipient.
+
+#### Architecture
+```
+zkSNARK Withdrawal → Intermediate Wallet 1 (random %)
+                  → Intermediate Wallet 2 (random %)
+                  → ...
+                  → Intermediate Wallet N (remainder)
+                  
+[Wait for confirmations]
+
+Bundler: Intermediate Wallets → Final Recipient
+```
+
+#### Flow
+```
+1. Client generates zkSNARK proof for total withdrawal amount
+2. Client generates first intermediate wallet keypair
+3. Relayer receives explosive withdrawal request with:
+   - Standard memo (proof + public signals)
+   - Number of hops (default: 3)
+   - Wallets per hop (default: 10)
+   - First intermediate wallet secret key
+   - Final recipient address
+4. Relayer executes standard prepare + execute to first intermediate wallet
+5. For each hop:
+   a. Generate N random intermediate wallets
+   b. Deterministic random split of funds (5-20% per wallet)
+   c. Execute transfers to intermediate wallets
+   d. Wait for confirmations
+6. Final bundler:
+   a. Collect funds from all intermediate wallets
+   b. Aggregate to single bundler wallet (highest balance pays fees)
+   c. Transfer net amount to final recipient
+7. Return detailed hop breakdown to client
+```
+
+**Privacy Benefits:**
+- **Amount Obfuscation**: Single withdrawal appears as many unrelated small transfers
+- **Timing Separation**: Hops executed across different blocks/time periods
+- **Graph Breaking**: On-chain analysis cannot link zkSNARK withdrawal to final recipient
+- **Mixing Depth**: Configurable hops (1-10) × wallets per hop (1-15)
+
+**Parameters:**
+- `MAX_EXPLOSIVE_RECEIVERS = 10`: Maximum intermediate wallets per on-chain instruction
+- `--hops`: Number of sequential mixing rounds (default: 3)
+- `--wallets`: Intermediate wallets per hop (default: 10)
+- Split algorithm: Deterministic pseudo-random using withdrawal nonce as seed
+
+**Example:**
+```bash
+# 5 hops × 15 wallets = 75 total intermediate wallets
+node tests/withdraw_join_split.js \
+  --explosive \
+  --hops 5 \
+  --wallets 15
+```
+
+**Security Considerations:**
+- First intermediate wallet must be fresh (not linked to user identity)
+- Bundler transaction reveals final recipient (trade-off for fund delivery)
+- On-chain footprint: 1 zkSNARK prepare/execute + N intermediate transfers + 1 bundler
+- Relayer has visibility into full hop graph (trust required)
+
+### Recovery Mechanisms
+
+#### Emergency Withdraw (Expired Notes)
+For notes with roots no longer in history (>ROOT_HISTORY deposits old):
+```
+- Original depositor can recover funds
+- Bypasses zkSNARK proof requirement
+- WARNING: Links deposit → withdrawal on-chain (breaks privacy)
+- Creates nullifier to prevent double-spend
+```
+
+#### Salted Nullifier Recovery
+For deposits with orphaned nullifiers from failed withdrawals:
+```
+- Uses salted nullifier to avoid conflicts
+- Requires original depositor signature
+- Bypasses stuck nullifiers
+- Maintains double-spend protection
+```
+
+#### Orphaned Nullifier Cleanup
+For nullifiers created during failed prepare_withdraw:
+```
+- Safety checks: Note exists + PreparedTx doesn't exist + Depositor signature
+- Deletes orphaned nullifier PDA
+- Refunds rent to depositor
+- Allows retry of withdrawal
+```
 
 ### Join-Split Transactions
 
@@ -375,7 +502,7 @@ if [[ -x "./target/release/circom" ]]; then
 elif command -v circom >/dev/null 2>&1; then
   CIRCOM="$(command -v circom)"
 else
-  echo "❌ circom binary not found."
+  echo "Error: circom binary not found."
   echo "   Either build it to ./target/release/circom or install it globally (cargo install circom) so 'circom' is in \$PATH."
   exit 1
 fi
@@ -485,70 +612,153 @@ ZKEY_PATH="/path/to/circom-chan/circuits/privw_final.zkey"
 
 ### Running Tests
 
-#### Deposit Test
-```bash
-npm run test:deposit
+#### Comprehensive Test Suite
 
-# Or with custom params
-PROGRAM_ID="..." PRIVATE_KEY="..." node tests/run_deposits.js \
-  --rpc "https://api.devnet.solana.com" \
-  --amount 2000000 \
-  --memo-out "deposit_memo.bin" \
-  --wallet-state "wallet_state.json"
+Run the full test suite with quality checks:
+
+```bash
+# Run all tests and quality checks
+./test_all.sh
+
+# Options:
+./test_all.sh --tests-only      # Run only tests (skip quality checks)
+./test_all.sh --quality-only    # Run only quality checks (skip tests)
+./test_all.sh --quick           # Skip clean/rebuild
 ```
 
-#### Withdrawal Test
+**Test Coverage:**
+- 53 unit tests across 6 test modules
+- Security tests (16 attack vectors)
+- Accounting tests (pool invariants)
+- Cryptography tests (proof verification)
+- State management tests
+- Penetration tests
+- Integration summary
+
+**Quality Checks:**
+- Code formatting (rustfmt)
+- Linting (clippy)
+- Security audit (cargo-audit)
+- Dependency validation
+- Release build verification
+
+#### Integration Tests
+
+**Deposit Test:**
 ```bash
-# Start relayer (separate terminal)
-npm run relayer
+node tests/run_deposits.js \
+  --rpc https://api.devnet.solana.com \
+  --amount 5000000000
+```
 
-# Execute join-split withdrawal
-npm run test:withdraw
+**Standard Withdrawal:**
+```bash
+# Terminal 1: Start relayer
+node tests/relayer.js
 
-# Or with custom params
-PROGRAM_ID="..." PRIVATE_KEY="..." node tests/withdraw_join_split.js \
-  --wasm /path/to/circom-chan/circuits/poseidon_main.wasm \
-  --zkey /path/to/circom-chan/circuits/privw_final.zkey \
-  --wallet-state wallet_state.json \
-  --recipient <pubkey> \
-  --relayer ws://127.0.0.1:8787
+# Terminal 2: Execute withdrawal
+node tests/withdraw_join_split.js \
+  --amount 4900000000 \
+  --recipient GzVQTNRPGDKRADmQLw5mQNj7B9xMRtJm4bCqJohBJJWn \
+  --wasm circuits/poseidon_main.wasm \
+  --zkey circuits/privw_final.zkey \
+  --rpc https://api.devnet.solana.com \
+  --relayer-ws ws://127.0.0.1:8787
+```
+
+**Explosive Withdrawal (Enhanced Privacy):**
+```bash
+# Multi-hop privacy mixing with 5 hops × 15 wallets = 75 intermediate wallets
+node tests/withdraw_join_split.js \
+  --amount 4900000000 \
+  --recipient GzVQTNRPGDKRADmQLw5mQNj7B9xMRtJm4bCqJohBJJWn \
+  --wasm circuits/poseidon_main.wasm \
+  --zkey circuits/privw_final.zkey \
+  --explosive \
+  --hops 5 \
+  --wallets 15 \
+  --rpc https://api.devnet.solana.com \
+  --relayer-ws ws://127.0.0.1:8787
 ```
 
 ### Relayer Service
 
-The relayer is a WebSocket service that:
-1. Accepts withdrawal requests from clients
-2. Validates memo format and proof (optional off-chain verification)
-3. Submits `prepare_withdraw_via_memo` transaction
-4. After confirmation, submits `execute_prepared_withdraw`
-5. Returns transaction signature to client
+The relayer is a TypeScript WebSocket service that handles withdrawal transactions:
 
-**Protocol:**
+**Key Functions:**
+1. Accepts withdrawal requests via WebSocket
+2. Validates memo format and extracts public signals
+3. Submits `prepare_withdraw_via_memo` transaction
+4. Waits for confirmation, then submits `execute_prepared_withdraw`
+5. Handles explosive withdrawals with multi-hop mixing
+6. Returns transaction signatures to client
+
+**WebSocket Protocol:**
+
+**Standard Withdrawal Request:**
 ```json
-// Request
 {
-  "id": "unique-request-id",
+  "id": "uuid",
   "type": "withdraw_via_memo_join_split",
   "programId": "6mXQ...",
   "recipient": "8Ty6...",
-  "memoPackedBase64": "..."
+  "memoPackedBase64": "...",
+  "publicSignals": [...],
+  "statePda": "...",
+  "poolPda": "...",
+  "escrowPda": "...",
+  "merkleRoot": "..."
 }
+```
 
-// Response (success)
+**Explosive Withdrawal Request:**
+```json
 {
-  "id": "unique-request-id",
+  "id": "uuid",
+  "type": "explosive_multi_hop",
+  "programId": "6mXQ...",
+  "recipient": "8Ty6...",
+  "memoPackedBase64": "...",
+  "publicSignals": [...],
+  "statePda": "...",
+  "poolPda": "...",
+  "escrowPda": "...",
+  "merkleRoot": "...",
+  "hops": 5,
+  "walletsPerHop": 15,
+  "firstIntermediateSecretKey": [...],
+  "finalRecipient": "..."
+}
+```
+
+**Success Response:**
+```json
+{
+  "id": "uuid",
   "ok": true,
-  "signature": "5xY7..."
+  "signature": "5xY7...",
+  "preparedSig": "...",
+  "hopDetails": [...],
+  "totalWallets": 75
 }
+```
 
-// Response (error)
+**Error Response:**
+```json
 {
-  "id": "unique-request-id",
+  "id": "uuid",
   "ok": false,
   "error": "Pool insufficient funds",
   "logs": ["..."]
 }
 ```
+
+**Explosive Withdrawal Features:**
+- Automatic multi-hop wallet generation
+- Random amount splitting across intermediate wallets
+- Sequential hop execution with confirmations
+- Final bundler transaction to recipient
+- Detailed hop tracking in response
 
 ### System Constraints
 
@@ -559,8 +769,24 @@ The relayer is a WebSocket service that:
 5. **Relayer Architecture**: Centralized coordinator (decentralization on roadmap)
 6. **Asset Support**: Native SOL only (SPL token integration planned)
 
-### Development Roadmap
+### Features
 
+**Current Implementation:**
+- Groth16 zkSNARK proof verification on-chain using BN254 curve
+- Two-phase withdrawal system (prepare + execute) for MEV resistance
+- Join-split transactions supporting up to 6 inputs and 6 outputs
+- Explosive withdrawals with multi-hop privacy mixing (up to 10 intermediate wallets per hop)
+- Emergency recovery mechanism for expired notes
+- Salted nullifier recovery for failed withdrawals
+- Orphaned nullifier cleanup for retry capability
+- Compressed memo format for transaction size optimization
+- Root history buffer (1000 roots) for flexible proof generation window
+- Pool invariant validation on every withdrawal
+- Comprehensive test suite (53 tests, 6 modules, 16 attack vectors)
+- TypeScript relayer with WebSocket API
+- Automated quality checks (format, lint, security audit)
+
+**Development Roadmap:**
 - [ ] Decentralized relayer network with cryptoeconomic incentives
 - [ ] Multi-asset support via SPL token integration
 - [ ] Versioned transaction format with address lookup tables
@@ -602,6 +828,7 @@ The relayer is a WebSocket service that:
 | MAX_FEE_BPS | 500 | 5% maximum fee cap |
 | MAX_INS | 6 | Maximum input notes |
 | MAX_OUTS | 6 | Maximum output notes |
+| MAX_EXPLOSIVE_RECEIVERS | 10 | Maximum intermediate wallets for explosive withdrawals |
 
 ### Error Codes
 
@@ -616,6 +843,14 @@ The relayer is a WebSocket service that:
 | 6012 | InsufficientPoolFunds | Pool cannot cover withdrawal |
 | 6013 | Unauthorized | Relayer not whitelisted |
 | 6014 | PoolInvariantViolation | Accounting invariant broken |
+| 6015 | InvalidExplosiveSplit | Explosive withdrawal split validation failed |
+| 6016 | MissingIntermediateWallet | Required intermediate wallet account missing |
+| 6017 | InvalidIntermediateWallet | Wallet doesn't match explosive withdrawal state |
+| 6018 | AlreadyExecuted | Explosive withdrawal already executed |
+| 6019 | WithdrawalInProgress | Cannot delete nullifier while PreparedTx exists |
+| 6020 | NullifierNotFound | Specified nullifier doesn't exist |
+| 6021 | NoteNotFound | Note doesn't exist (may be withdrawn) |
+| 6022 | NoteStillExists | Cannot use orphaned recovery when note exists |
 
 ## License
 

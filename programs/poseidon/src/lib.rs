@@ -1,26 +1,27 @@
 #![deny(unused_must_use)]
 #![allow(ambiguous_glob_reexports)]
 #![allow(hidden_glob_reexports)]
+#![allow(unexpected_cfgs)]
 
 mod utils;
 mod instructions;
 mod vk;
+
+#[cfg(test)]
+mod tests;
 
 pub use utils::*;
 pub use instructions::*;
 
 use anchor_lang::prelude::*;
 
-declare_id!("6mXQkJeRkxyjvcrQB7L7Ww2ygK4r3MQXZEwTtxgYoYB9");
+declare_id!("7oncpraGxTtXjkQsQytWQRYNCuRKXHkHzypMdpfjEwLN");
+// Number of main public signals (taken from VK to avoid drift)
 pub const NR_PUBINPUTS_LOCAL: usize = vk::VK_NR_PUBINPUTS;
 
 #[program]
 pub mod privacy_wallet {
     use super::*;
-
-    pub fn migrate_to_poseidon(ctx: Context<MigrateState>) -> Result<()> {
-        instructions::migrate::migrate_to_poseidon(ctx)
-    }
 
     pub fn init_state(ctx: Context<InitState>) -> Result<()> {
         instructions::init::init_state(ctx)
@@ -57,7 +58,58 @@ pub mod privacy_wallet {
     ) -> Result<()> {
         instructions::emergency::emergency_withdraw(ctx, commitment)
     }
+
+    pub fn prepare_explosive_withdraw<'info>(
+        ctx: Context<'_, '_, '_, 'info, PrepareExplosiveWithdraw<'info>>,
+        memo: Vec<u8>,
+        intermediate_wallets: [Pubkey; MAX_EXPLOSIVE_RECEIVERS],
+        nonce: u64,
+    ) -> Result<()> {
+        let parsed = parse_withdraw_memo(&memo)?;
+        instructions::explosive::prepare_explosive_withdraw(ctx, memo, parsed, intermediate_wallets, nonce)
+    }
+
+    pub fn execute_explosive_withdraw<'info>(
+        ctx: Context<'_, '_, 'info, 'info, ExecuteExplosiveWithdraw<'info>>,
+    ) -> Result<()> {
+        instructions::explosive::execute_explosive_withdraw(ctx)
+    }
+
+    pub fn delete_orphaned_nullifier(
+        ctx: Context<DeleteOrphanedNullifier>,
+        commitment: [u8; 32],
+        nullifier: [u8; 32],
+    ) -> Result<()> {
+        instructions::cleanup::delete_orphaned_nullifier(ctx, commitment, nullifier)
+    }
+
+    pub fn execute_explosive_single<'info>(
+        ctx: Context<'_, '_, 'info, 'info, ExecuteExplosiveSingle<'info>>,
+        wallet_index: u8,
+    ) -> Result<()> {
+        instructions::explosive::execute_explosive_single(ctx, wallet_index)
+    }
+
+    pub fn emergency_recover_with_salt(
+        ctx: Context<EmergencyRecoverWithSalt>,
+        commitment: [u8; 32],
+        salt: u64,
+    ) -> Result<()> {
+        instructions::recover::emergency_recover_with_salt(ctx, commitment, salt)
+    }
+
+    pub fn emergency_recover_orphaned(
+        ctx: Context<EmergencyRecoverOrphaned>,
+        commitment: [u8; 32],
+        amount: u64,
+        salt: u64,
+        depositor_override: Pubkey,
+    ) -> Result<()> {
+        instructions::recover::emergency_recover_orphaned(ctx, commitment, amount, salt, depositor_override)
+    }
 }
+
+/* ============================== Memo Parsing ================================ */
 
 pub struct ParsedWithdrawMemo {
     pub proof_a: [u8;64],
@@ -92,6 +144,7 @@ fn parse_withdraw_memo(memo: &[u8]) -> Result<ParsedWithdrawMemo> {
         input_nullifiers[i] = read_arr::<32>(memo, &mut off)?;
     }
 
+    // Read flag (1 byte)
     require!(off + 1 <= memo.len(), errors::ErrorCode::MemoParseError);
     let flag = memo[off];
     off += 1;
@@ -100,6 +153,7 @@ fn parse_withdraw_memo(memo: &[u8]) -> Result<ParsedWithdrawMemo> {
 
     let mut output_commitments = [[0u8; 32]; MAX_OUTS];
     if is_full_withdraw {
+        // Reconstruct zeros (no further read)
         for i in 0..MAX_OUTS {
             output_commitments[i] = [0u8; 32];
         }

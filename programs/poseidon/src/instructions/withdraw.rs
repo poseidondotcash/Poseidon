@@ -14,6 +14,51 @@ pub fn prepare_withdraw_via_memo<'info>(
     _memo: Vec<u8>,
     parsed: ParsedWithdrawMemo,
 ) -> Result<()> {
+    const ZERO32: [u8; 32] = [0u8; 32];
+    let rent = Rent::get()?;
+    
+    let num_nullifiers = parsed.input_nullifiers.iter()
+        .take(parsed.n_inputs as usize)
+        .filter(|nf| **nf != ZERO32)
+        .count();
+    
+    let num_outputs = parsed.output_commitments.iter()
+        .filter(|c| **c != ZERO32)
+        .count();
+    
+    let nullifier_rent = rent.minimum_balance(NullifierFlag::LEN);
+    let note_rent = rent.minimum_balance(NoteRecord::len_for(0)); // 0 cipher for change notes
+    let prep_rent = rent.minimum_balance(PreparedTx::LEN);
+    
+    let total_rent_needed = nullifier_rent
+        .checked_mul(num_nullifiers as u64)
+        .and_then(|n| n.checked_add(note_rent.checked_mul(num_outputs as u64)?))
+        .and_then(|n| n.checked_add(prep_rent))
+        .and_then(|n| n.checked_add(RELAYER_GAS_BUFFER_LAMPORTS))
+        .ok_or(ErrorCode::Overflow)?;
+    
+    let escrow_balance = ctx.accounts.escrow.lamports();
+    
+    if escrow_balance < total_rent_needed {
+        let need = total_rent_needed
+            .checked_sub(escrow_balance)
+            .ok_or(ErrorCode::Overflow)?;
+        
+        system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                system_program::Transfer {
+                    from: ctx.accounts.signer.to_account_info(),
+                    to: ctx.accounts.escrow.to_account_info(),
+                },
+            ),
+            need,
+        )?;
+        
+        msg!("💰 Topped up escrow by {} lamports ({} nullifiers, {} notes, current: {}, target: {})", 
+             need, num_nullifiers, num_outputs, escrow_balance, total_rent_needed);
+    }
+    
     let authorized_relayer = Pubkey::from_str(AUTHORIZED_RELAYER)
         .map_err(|_| ErrorCode::Unauthorized)?;
     require_keys_eq!(
@@ -24,7 +69,9 @@ pub fn prepare_withdraw_via_memo<'info>(
 
     let recipient_pk = ctx.accounts.recipient.key();
 
-    let limbs = pubkey_to_u64_limbs_le(&recipient_pk);OCAL] = [[0u8; 32]; NR_PUBINPUTS_LOCAL];
+    let limbs = pubkey_to_u64_limbs_le(&recipient_pk);
+
+    let mut pubs_be: [[u8; 32]; NR_PUBINPUTS_LOCAL] = [[0u8; 32]; NR_PUBINPUTS_LOCAL];
 
     for i in 0..MAX_INS {
         pubs_be[i] = parsed.input_nullifiers[i];
@@ -97,11 +144,6 @@ pub fn prepare_withdraw_via_memo<'info>(
         ErrorCode::InsufficientPoolFunds
     );
 
-    for limb in limbs.iter() {
-        require!(*limb < u64::MAX, ErrorCode::InvalidPublicInput);
-    }
-
-    const ZERO32: [u8; 32] = [0u8; 32];
     let mut remaining_idx = 0;
 
     for (i, nf) in parsed.input_nullifiers.iter().enumerate() {
@@ -112,7 +154,7 @@ pub fn prepare_withdraw_via_memo<'info>(
             continue;
         }
 
-        let (null_pda, null_bump) =
+        let (null_pda, _null_bump) =
             Pubkey::find_program_address(&[b"null", nf], &crate::ID);
 
         let null_ai_ref = ctx
@@ -127,28 +169,6 @@ pub fn prepare_withdraw_via_memo<'info>(
             null_ai_ref.data_is_empty(),
             ErrorCode::NullifierAlreadyUsed
         );
-
-        let null_rent = Rent::get()?.minimum_balance(NullifierFlag::LEN);
-        system_program::create_account(
-            CpiContext::new_with_signer(
-                ctx.accounts.system_program.to_account_info(),
-                system_program::CreateAccount {
-                    from: ctx.accounts.escrow.to_account_info(),
-                    to:   null_ai_ref.to_account_info(),
-                },
-                &[
-                    &[b"escrow", &[ctx.accounts.state.escrow_bump]],
-                    &[b"null", nf.as_ref(), &[null_bump]],
-                ],
-            ),
-            null_rent,
-            NullifierFlag::LEN as u64,
-            &crate::ID,
-        )?;
-
-        let mut nd = null_ai_ref.try_borrow_mut_data()?;
-        nd[0..8].copy_from_slice(&NullifierFlag::DISCRIMINATOR);
-        nd[8] = null_bump;
     }
 
     for (j, commitment) in parsed.output_commitments.iter().enumerate() {
@@ -245,6 +265,55 @@ pub fn prepare_withdraw_via_memo<'info>(
         data[50..82].copy_from_slice(&ctx.accounts.relayer.key().to_bytes());
         data[82..90].copy_from_slice(&to_recipient.to_le_bytes());
         data[90..98].copy_from_slice(&to_relayer.to_le_bytes());
+    }
+
+    remaining_idx = 0;
+
+    for (i, nf) in parsed.input_nullifiers.iter().enumerate() {
+        if (i as u32) >= parsed.n_inputs {
+            break;
+        }
+        if *nf == ZERO32 {
+            continue;
+        }
+
+        let (null_pda, null_bump) =
+            Pubkey::find_program_address(&[b"null", nf], &crate::ID);
+
+        let null_ai_ref = ctx
+            .remaining_accounts
+            .get(remaining_idx)
+            .ok_or(error!(ErrorCode::MissingNullifierPda))?;
+        
+        require_keys_eq!(null_ai_ref.key(), null_pda, ErrorCode::MissingNullifierPda);
+        remaining_idx += 1;
+
+        require!(
+            null_ai_ref.data_is_empty(),
+            ErrorCode::NullifierAlreadyUsed
+        );
+
+        let null_rent = Rent::get()?.minimum_balance(NullifierFlag::LEN);
+        system_program::create_account(
+            CpiContext::new_with_signer(
+                ctx.accounts.system_program.to_account_info(),
+                system_program::CreateAccount {
+                    from: ctx.accounts.escrow.to_account_info(),
+                    to:   null_ai_ref.to_account_info(),
+                },
+                &[
+                    &[b"escrow", &[ctx.accounts.state.escrow_bump]],
+                    &[b"null", nf.as_ref(), &[null_bump]],
+                ],
+            ),
+            null_rent,
+            NullifierFlag::LEN as u64,
+            &crate::ID,
+        )?;
+
+        let mut nd = null_ai_ref.try_borrow_mut_data()?;
+        nd[0..8].copy_from_slice(&NullifierFlag::DISCRIMINATOR);
+        nd[8] = null_bump;
     }
 
     emit!(PreparedWithdraw {

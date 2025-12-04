@@ -1,12 +1,8 @@
-//! Fetch note instruction - retrieve encrypted note data
-
 use anchor_lang::prelude::*;
 use crate::state::NoteRecord;
 use crate::errors::ErrorCode;
 
-/// Fetch and emit encrypted note data
 pub fn fetch_note(ctx: Context<FetchNote>, commitment: [u8; 32]) -> Result<()> {
-    // Manually deserialize NoteRecord
     let data = ctx.accounts.note.try_borrow_data()?;
     require!(&data[0..8] == &NoteRecord::DISCRIMINATOR, ErrorCode::MemoParseError);
     

@@ -6,6 +6,7 @@ pub mod state;
 pub mod utils;
 pub mod verification;
 
+// Re-export everything for convenience
 pub use constants::*;
 pub use crypto::*;
 pub use merkle::*;

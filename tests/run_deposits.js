@@ -306,9 +306,9 @@ function explorerTxUrl(sig, rpcUrl) {
     BigInt("0x" + crypto.randomBytes(32).toString("hex")) % BigInt(BJ.subOrder);
   if (NOTE_NONCE_256 === 0n) NOTE_NONCE_256 = 1n;
 
-  const noteCommitFe = Poseidon([
-  DEPOSIT_LAMPORTS,   // inBalance
-  NOTE_NONCE_256,     // inNoteNonce
+const noteCommitFe = Poseidon([
+  DEPOSIT_LAMPORTS,
+  NOTE_NONCE_256,
 ]);
 
   const depositCommitment = BigInt(BJ.F.toObject(noteCommitFe));
@@ -393,8 +393,8 @@ function explorerTxUrl(sig, rpcUrl) {
 
   const stateAi = await conn.getAccountInfo(pdaState());
   if (!stateAi) throw new Error("Failed to read state after deposit");
-  const nextIndex = stateAi.data.readUInt32LE(8 + 32 + 1 + 1 + 1);
-  const treeIndex = nextIndex - 1;
+  const nextIndex = stateAi.data.readUInt32LE(8 + 32 + 1 + 1 + 1); // next_index (AFTER deposit)
+  const treeIndex = nextIndex - 1; // The note was inserted at next_index - 1
   console.log("[ledger] Assigned treeIndex:", treeIndex);
 
   ledger.notes.push({

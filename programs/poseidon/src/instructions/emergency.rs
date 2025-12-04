@@ -8,7 +8,6 @@ pub fn emergency_withdraw(
     ctx: Context<EmergencyWithdraw>,
     commitment: [u8; 32],
 ) -> Result<()> {
-    // Manually deserialize NoteRecord
     let note_data = ctx.accounts.note.try_borrow_data()?;
     require!(&note_data[0..8] == &NoteRecord::DISCRIMINATOR, ErrorCode::MemoParseError);
     
@@ -17,7 +16,6 @@ pub fn emergency_withdraw(
     let depositor = Pubkey::new_from_array(note_data[45..77].try_into().unwrap());
     let amount = u64::from_le_bytes(note_data[77..85].try_into().unwrap());
     
-    // Verify commitment matches
     require!(stored_commitment == commitment, ErrorCode::MemoParseError);
     
     require!(
@@ -27,8 +25,6 @@ pub fn emergency_withdraw(
 
     let state = &ctx.accounts.state;
     
-    // The note was inserted at note_index. After ROOT_HISTORY more deposits,
-    // its root would be pushed out. Check if current index is far enough ahead.
     let current_index = state.next_index;
     let deposits_since_note = current_index.saturating_sub(note_index);
     
@@ -93,14 +89,12 @@ pub fn emergency_withdraw(
         amount,
     )?;
 
-    // 6) Update accounting
     let state = &mut ctx.accounts.state;
     state.total_withdrawn = state
         .total_withdrawn
         .checked_add(amount)
         .ok_or(ErrorCode::Overflow)?;
 
-    // 7) Verify accounting invariant (pool must remain >= deposits - withdrawals)
     require!(
         ctx.accounts.pool.lamports()
             + RENT_WIGGLE

@@ -1,8 +1,9 @@
 use anchor_lang::prelude::*;
 use groth16_solana::groth16::{Groth16Verifier, Groth16Verifyingkey};
 use crate::vk::{VK_ALPHA_G1, VK_BETA_G2, VK_DELTA_G2, VK_GAMME_G2, VK_IC, VK_NR_PUBINPUTS};
-use crate::crypto::{g1_be_to_le, g1_negate_be, g2_be_swap_to_le_noswap, flip_chunks_32};
+use crate::crypto::{g1_be_to_le, g1_negate_be, g2_be_swap_to_le_noswap, flip_chunks_32, is_less_than_bn254_p};
 use crate::errors::ErrorCode;
+
 pub fn load_vk_le() -> Groth16Verifyingkey<'static> {
     let ic_le: Vec<[u8; 64]> = VK_IC
         .iter()
@@ -34,6 +35,13 @@ pub fn verify_groth16<const N: usize>(
 
     let vk = load_vk_le();
 
+    for pub_input in public_inputs_be.iter() {
+        require!(
+            is_less_than_bn254_p(pub_input),
+            ErrorCode::InvalidPublicInput
+        );
+    }
+
     let mut pub_inputs_le: [[u8; 32]; N] = [[0u8; 32]; N];
     for i in 0..N {
         pub_inputs_le[i] = flip_chunks_32::<32>(&public_inputs_be[i]);
@@ -43,30 +51,4 @@ pub fn verify_groth16<const N: usize>(
         .map_err(|_| error!(ErrorCode::InvalidProof))?;
     
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_load_vk() {
-        let vk = load_vk_le();
-        assert_eq!(vk.nr_pubinputs, VK_NR_PUBINPUTS);
-        assert_eq!(vk.vk_ic.len(), VK_IC.len());
-    }
-
-    #[test]
-    fn test_vk_alpha_conversion() {
-        let vk = load_vk_le();
-        // Alpha should be 64 bytes (G1 point)
-        assert_eq!(vk.vk_alpha_g1.len(), 64);
-    }
-
-    #[test]
-    fn test_vk_beta_conversion() {
-        let vk = load_vk_le();
-        // Beta should be 128 bytes (G2 point)
-        assert_eq!(vk.vk_beta_g2.len(), 128);
-    }
 }

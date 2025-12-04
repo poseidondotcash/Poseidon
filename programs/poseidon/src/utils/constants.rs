@@ -7,6 +7,7 @@ pub const MAX_FEE_BPS: u64 = 500;
 pub const RENT_WIGGLE: u64 = 1_000_000;
 pub const MAX_INS: usize = 6;
 pub const MAX_OUTS: usize = 6;
+pub const MAX_EXPLOSIVE_RECEIVERS: usize = 10;
 
 pub const BN254_P_BE: [u8; 32] = [
     0x30, 0x64, 0x4e, 0x72, 0xe1, 0x31, 0xa0, 0x29,

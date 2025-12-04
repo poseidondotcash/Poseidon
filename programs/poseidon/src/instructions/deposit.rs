@@ -3,6 +3,7 @@ use anchor_lang::system_program;
 use crate::state::{GlobalState, NoteRecord};
 use crate::errors::ErrorCode;
 use crate::merkle::insert_leaf;
+use crate::constants::RELAYER_GAS_BUFFER_LAMPORTS;
 
 pub fn deposit_with_note<'info>(
     ctx: Context<'_, '_, '_, 'info, DepositWithNote<'info>>,
@@ -10,6 +11,32 @@ pub fn deposit_with_note<'info>(
     commitment: [u8; 32],
     ciphertext: Vec<u8>,
 ) -> Result<()> {
+    let note_rent = Rent::get()?.minimum_balance(NoteRecord::len_for(ciphertext.len()));
+    let escrow_balance = ctx.accounts.escrow.lamports();
+    let target_balance = note_rent
+        .checked_add(RELAYER_GAS_BUFFER_LAMPORTS)
+        .ok_or(ErrorCode::Overflow)?;
+    
+    if escrow_balance < target_balance {
+        let need = target_balance
+            .checked_sub(escrow_balance)
+            .ok_or(ErrorCode::Overflow)?;
+        
+        system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                system_program::Transfer {
+                    from: ctx.accounts.depositor.to_account_info(),
+                    to: ctx.accounts.escrow.to_account_info(),
+                },
+            ),
+            need,
+        )?;
+        
+        msg!("💰 Topped up escrow by {} lamports (current: {}, target: {})", 
+             need, escrow_balance, target_balance);
+    }
+
     system_program::transfer(
         CpiContext::new(
             ctx.accounts.system_program.to_account_info(),
@@ -29,6 +56,7 @@ pub fn deposit_with_note<'info>(
         .ok_or(ErrorCode::Overflow)?;
 
     let (idx, new_root) = insert_leaf(&mut ctx.accounts.state, commitment)?;
+
     let note_ai_ref = &ctx.accounts.note;
     if note_ai_ref.data_len() == 0 {
         let space = NoteRecord::len_for(ciphertext.len());
