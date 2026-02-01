@@ -4,9 +4,32 @@ include "../circomlib/circuits/poseidon.circom";
 include "../circomlib/circuits/comparators.circom";
 
 include "utils.circom";
+include "crypto.circom";
 include "merkle.circom";
 
+/******************************************
+ * Cross-Shard Join-Split UTXO Circuit
+ *
+ * Supports spending notes from up to 5 different shards
+ * in a single transaction. Each input note has its own
+ * merkle root, enabling cross-shard withdrawals.
+ *
+ * Parameters:
+ *  - nIns: number of input notes (5)
+ *  - nOuts: number of output notes (6)
+ *  - depth: Merkle tree depth (26)
+ *
+ * Public signals (22 total):
+ *  - merkleRoots[5] (5) - one root per input note
+ *  - inputNullifier[5] (5)
+ *  - destLimbs[4] (4)
+ *  - outputCommitment[6] (6)
+ *  - publicAmount (1)
+ *  - extAmountIn (1)
+ ******************************************/
+
 template PrivateStealthJoinSplit(nIns, nOuts, depth) {
+    /*************** Private inputs ***************/
     signal input inBalance[nIns];
     signal input inSpendNonce[nIns];
     signal input inNoteNonce[nIns];
@@ -18,13 +41,18 @@ template PrivateStealthJoinSplit(nIns, nOuts, depth) {
     signal input outAmount[nOuts];
     signal input outNoteNonce[nOuts];
 
-    signal input merkleRoot;
+    /*************** Public inputs ***************/
+
+    // Per-input merkle roots - each note can be from a different shard
+    signal input merkleRoots[nIns];
+
     signal input inputNullifier[nIns];
     signal input destLimbs[4];
     signal input outputCommitment[nOuts];
     signal input publicAmount;
     signal input extAmountIn;
 
+    /*************** Range checks ***************/
     component inBalRC[nIns];
     for (var i = 0; i < nIns; i++) {
         inBalRC[i] = RangeCheckAmount(64);
@@ -43,6 +71,7 @@ template PrivateStealthJoinSplit(nIns, nOuts, depth) {
     component pubRC = RangeCheckAmount(64);
     pubRC.v <== publicAmount;
 
+    /*************** Amount join-split invariant ***************/
     component sumIn = SumN(nIns);
     component sumOut = SumN(nOuts);
 
@@ -55,6 +84,7 @@ template PrivateStealthJoinSplit(nIns, nOuts, depth) {
 
     sumIn.out + extAmountIn === sumOut.out + publicAmount;
 
+    /*************** Input commitments + Merkle membership ***************/
     component inCommitPoseidon[nIns];
     component inPath[nIns];
     component isZeroBalance[nIns];
@@ -75,9 +105,12 @@ template PrivateStealthJoinSplit(nIns, nOuts, depth) {
             inPath[i3].pathIndex[d]   <== inPathIndex[i3][d];
         }
 
-        (1 - isZeroBalance[i3].out) * (inPath[i3].root - merkleRoot) === 0;
+        // Each input validates against its OWN merkle root
+        // Dummy inputs (zero balance) skip validation
+        (1 - isZeroBalance[i3].out) * (inPath[i3].root - merkleRoots[i3]) === 0;
     }
 
+    /*************** Output commitments ***************/
     component outCommitPoseidon[nOuts];
     for (var k = 0; k < nOuts; k++) {
         outCommitPoseidon[k] = Poseidon(2);
@@ -86,12 +119,14 @@ template PrivateStealthJoinSplit(nIns, nOuts, depth) {
         outCommitPoseidon[k].out === outputCommitment[k];
     }
 
+    /*************** Destination validation ***************/
     component destRC[4];
     for (var d = 0; d < 4; d++) {
         destRC[d] = RangeCheckAmount(64);
         destRC[d].v <== destLimbs[d];
     }
 
+    /*************** Per-note nullifiers ***************/
     component nullPose[nIns];
     for (var i4 = 0; i4 < nIns; i4++) {
         nullPose[i4] = Poseidon(2);
@@ -100,22 +135,25 @@ template PrivateStealthJoinSplit(nIns, nOuts, depth) {
         nullPose[i4].out === inputNullifier[i4];
     }
 
-    signal output pubMerkleRoot;
-    pubMerkleRoot <== merkleRoot;
+    /*************** Public outputs ***************/
+    signal output pubMerkleRoots[nIns];
+    for (var o0 = 0; o0 < nIns; o0++) {
+        pubMerkleRoots[o0] <== merkleRoots[o0];
+    }
 
     signal output pubInputNullifier[nIns];
-    for (var o0 = 0; o0 < nIns; o0++) {
-        pubInputNullifier[o0] <== inputNullifier[o0];
+    for (var o1 = 0; o1 < nIns; o1++) {
+        pubInputNullifier[o1] <== inputNullifier[o1];
     }
 
     signal output pubDestLimbs[4];
-    for (var o1 = 0; o1 < 4; o1++) {
-        pubDestLimbs[o1] <== destLimbs[o1];
+    for (var o2 = 0; o2 < 4; o2++) {
+        pubDestLimbs[o2] <== destLimbs[o2];
     }
 
     signal output pubOutputCommitment[nOuts];
-    for (var o2 = 0; o2 < nOuts; o2++) {
-        pubOutputCommitment[o2] <== outputCommitment[o2];
+    for (var o3 = 0; o3 < nOuts; o3++) {
+        pubOutputCommitment[o3] <== outputCommitment[o3];
     }
 
     signal output pubPublicAmount;
@@ -125,4 +163,13 @@ template PrivateStealthJoinSplit(nIns, nOuts, depth) {
     pubExtAmountIn <== extAmountIn;
 }
 
-component main = PrivateStealthJoinSplit(6, 6, 20);
+/******************************************
+ * Main Component
+ *
+ * Configuration:
+ *  - nIns = 5 (input notes)
+ *  - nOuts = 6 (output notes)
+ *  - depth = 26 (Merkle tree depth)
+ ******************************************/
+
+component main = PrivateStealthJoinSplit(5, 6, 26);
