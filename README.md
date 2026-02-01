@@ -199,105 +199,40 @@ Real-world systems need escape hatches:
 
 ```
 programs/poseidon/src/
-├── lib.rs              # Entry point, program definition
-├── vk.rs               # Verifying key (auto-generated)
+├── lib.rs                # Program entry point
+├── vk.rs                 # Groth16 verifying key
 ├── instructions/
-│   ├── init.rs         # Initialize global state
-│   ├── deposit.rs      # Deposit funds into pool
-│   ├── withdraw.rs     # Two-phase withdrawal
-│   ├── explosive.rs    # Split withdrawals
-│   ├── fetch.rs        # Query note data
-│   ├── emergency.rs    # Emergency recovery
-│   ├── recover.rs      # Salted nullifier recovery
-│   └── cleanup.rs      # Orphaned nullifier cleanup
-└── utils/
-    ├── state.rs        # Account structures
-    ├── merkle.rs       # Sparse Merkle tree
-    ├── verification.rs # Groth16 proof verification
-    ├── crypto.rs       # BN254 field arithmetic
-    ├── constants.rs    # Program constants
-    └── errors.rs       # Error codes
+│   ├── mod.rs
+│   ├── init.rs           # Initialize global state
+│   ├── deposit.rs        # Deposit into pool
+│   ├── withdraw.rs       # Two-phase withdrawal
+│   ├── explosive.rs      # Split withdrawals
+│   ├── fetch.rs          # Query note data
+│   ├── emergency.rs      # Emergency recovery
+│   ├── recover.rs        # Salted nullifier recovery
+│   └── cleanup.rs        # Orphaned nullifier cleanup
+├── utils/
+│   ├── mod.rs
+│   ├── state.rs          # Account structures
+│   ├── merkle.rs         # Sparse Merkle tree
+│   ├── verification.rs   # Groth16 verification
+│   ├── crypto.rs         # BN254 field arithmetic
+│   ├── constants.rs      # Program constants
+│   ├── errors.rs         # Error codes
+│   └── utils.rs          # Helper functions
+└── tests/
+    ├── mod.rs
+    ├── accounting.rs     # Pool invariant tests
+    ├── cryptography.rs   # Proof verification tests
+    ├── security.rs       # Attack vector tests
+    ├── pentest.rs        # Penetration tests
+    ├── state.rs          # State management tests
+    └── summary.rs        # Test summary
 
 circuits/
 ├── poseidon_main.circom  # Main join-split circuit
 ├── merkle.circom         # Merkle path verification
 └── utils.circom          # Range checks, packing
-```
-
-## Getting Started
-
-### Prerequisites
-
-- Rust 1.70+
-- Solana CLI 1.18+
-- Anchor 0.32.1
-- Node.js 18+
-- circom 2.0.0
-
-### Build
-
-```bash
-# Install dependencies
-npm install
-
-# Build the program
-anchor build
-
-# Generate verifying key (requires circom-chan setup)
-node scripts/gen_vk_rs.js \
-  --vk /path/to/privw_vk.json \
-  --out programs/poseidon/src/vk.rs
-```
-
-### Deploy
-
-```bash
-anchor deploy --provider.cluster devnet
-```
-
-### Run Tests
-
-```bash
-# Full test suite with quality checks
-./test_all.sh
-
-# Tests only
-./test_all.sh --tests-only
-
-# Quick mode (skip rebuild)
-./test_all.sh --quick
-```
-
-### Integration Tests
-
-**Deposit:**
-```bash
-node tests/run_deposits.js \
-  --rpc https://api.devnet.solana.com \
-  --amount 5000000000
-```
-
-**Standard Withdrawal:**
-```bash
-# Terminal 1: Start relayer
-node tests/relayer.js
-
-# Terminal 2: Execute withdrawal
-node tests/withdraw_join_split.js \
-  --amount 4900000000 \
-  --recipient <PUBKEY> \
-  --wasm circuits/poseidon_main.wasm \
-  --zkey circuits/privw_final.zkey
-```
-
-**Explosive Withdrawal:**
-```bash
-node tests/withdraw_join_split.js \
-  --amount 4900000000 \
-  --recipient <PUBKEY> \
-  --explosive \
-  --hops 5 \
-  --wallets 15
 ```
 
 ## Constants
@@ -336,9 +271,9 @@ node tests/withdraw_join_split.js \
 
 ## Roadmap
 
-- [ ] Decentralized relayer network
-- [ ] SPL token support
-- [ ] Versioned transactions with ALTs
+- [x] Decentralized relayer network
+- [x] SPL token support
+- [x] Versioned transactions with ALTs
 - [ ] Recursive proof aggregation
 - [ ] Yield-bearing shielded positions
 - [ ] Mobile SDK
